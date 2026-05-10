@@ -2,6 +2,7 @@ use super::*;
 use crate::config::{ApiProvider, Config};
 use crate::config_ui::{self, WebConfigSession, WebConfigSessionEvent};
 use crate::core::engine::mock_engine_handle;
+#[cfg(not(windows))]
 use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
 use crate::tui::file_mention::{
     apply_mention_menu_selection, find_file_mention_completions, partial_file_mention_at_cursor,
