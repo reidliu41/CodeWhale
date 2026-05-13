@@ -1,6 +1,6 @@
 //! External-binary dependency resolution for tools that shell out to
-//! locally-installed programs (Python for `code_execution`, `pdftotext`
-//! for PDF reading in `read_file`, future tools as added).
+//! locally-installed programs (Python for `code_execution` / RLM REPL,
+//! `pdftotext` for PDF reading in `read_file`, future tools as added).
 //!
 //! Before v0.8.31, tools that called external binaries hardcoded the
 //! command name and failed at execution time when the binary wasn't on
@@ -9,8 +9,8 @@
 //! `python`, not `python3`) saw `Failed to execute tool: program not
 //! found` with no upstream hint of what was wrong.
 //!
-//! This module centralises the probe-then-decide pattern. The two
-//! supported callers today are:
+//! This module centralises the probe-then-decide pattern. The supported
+//! callers today are:
 //!
 //! - Tool catalog construction (`core::engine::tool_catalog`): for
 //!   tools that should be advertised to the model only when the
@@ -18,6 +18,8 @@
 //! - Doctor command (`run_doctor` in `main.rs`): for surfacing the
 //!   resolved state to the user so missing dependencies aren't an
 //!   invisible failure.
+//! - Long-lived REPL runtime (`repl::runtime`): for RLM and inline `repl`
+//!   blocks that need to spawn Python on every supported platform.
 //!
 //! Results are cached for the process lifetime via [`std::sync::OnceLock`]
 //! — probing a binary involves a `Command::output` per candidate and
@@ -83,7 +85,7 @@ pub fn resolve_python_interpreter() -> Option<String> {
                     tracing::info!(
                         target: "tool_dependencies",
                         candidate = candidate,
-                        "Resolved Python interpreter for code_execution",
+                        "Resolved Python interpreter",
                     );
                     return Some((*candidate).to_string());
                 }
@@ -91,7 +93,7 @@ pub fn resolve_python_interpreter() -> Option<String> {
             tracing::warn!(
                 target: "tool_dependencies",
                 tried = ?PYTHON_CANDIDATES,
-                "No Python interpreter found; code_execution tool will not be advertised",
+                "No Python interpreter found",
             );
             None
         })
@@ -111,6 +113,85 @@ pub fn resolve_pdftotext() -> Option<String> {
             if probe_executable("pdftotext") {
                 Some("pdftotext".to_string())
             } else {
+                None
+            }
+        })
+        .clone()
+}
+
+/// Resolve `tesseract` (OCR engine) once per process. Used by
+/// the `image_ocr` tool to decide whether to register itself with
+/// the model. Tesseract is the de-facto open-source OCR engine and
+/// ships as a single binary on every platform we support, so the
+/// candidate list is just `tesseract`.
+pub fn resolve_tesseract() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if probe_executable("tesseract") {
+                tracing::info!(
+                    target: "tool_dependencies",
+                    "Resolved tesseract binary for image_ocr",
+                );
+                Some("tesseract".to_string())
+            } else {
+                tracing::warn!(
+                    target: "tool_dependencies",
+                    "tesseract binary not found; image_ocr tool will not be registered",
+                );
+                None
+            }
+        })
+        .clone()
+}
+
+/// Resolve `pandoc` (universal document converter) once per
+/// process. Used by the `pandoc_convert` tool to decide whether
+/// to register itself with the model. Pandoc is a single-binary
+/// install, so the candidate list is just `pandoc` — no platform
+/// fallback path.
+pub fn resolve_pandoc() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if probe_executable("pandoc") {
+                tracing::info!(
+                    target: "tool_dependencies",
+                    "Resolved pandoc binary for pandoc_convert",
+                );
+                Some("pandoc".to_string())
+            } else {
+                tracing::warn!(
+                    target: "tool_dependencies",
+                    "pandoc binary not found; pandoc_convert tool will not be registered",
+                );
+                None
+            }
+        })
+        .clone()
+}
+
+/// Resolve the Node.js runtime once per process. Used by the
+/// `js_execution` tool to decide whether to advertise itself in
+/// the catalog. Unlike Python, the executable name `node` is the
+/// same across every platform we ship to — there's no `node3` or
+/// `node.exe` variant to fall through to — so this is a single
+/// probe rather than a candidate ladder.
+pub fn resolve_node() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if probe_executable("node") {
+                tracing::info!(
+                    target: "tool_dependencies",
+                    "Resolved Node.js runtime for js_execution",
+                );
+                Some("node".to_string())
+            } else {
+                tracing::warn!(
+                    target: "tool_dependencies",
+                    "Node.js runtime not found; js_execution tool will not be advertised",
+                );
                 None
             }
         })

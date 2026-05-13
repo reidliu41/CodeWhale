@@ -6,7 +6,7 @@
 use super::diff_format::make_unified_diff;
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
-    lsp_diagnostics_for_paths, optional_str, required_str,
+    lsp_diagnostics_for_paths, optional_bool, optional_str, required_str,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is; PDFs are auto-extracted via `pdftotext` (poppler) when available. Cannot read images or non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
+        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is; PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Cannot read images or non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
 
     fn input_schema(&self) -> Value {
@@ -234,23 +234,87 @@ fn parse_pages_arg(spec: &str) -> Option<(u32, u32)> {
 }
 
 fn read_pdf(path: &Path, pages: Option<&str>) -> Result<ToolResult, ToolError> {
-    // Try pdftotext (from the poppler suite). Other extractors (mutool,
-    // pdfminer) could be added later behind the same dispatch.
-    let mut cmd = Command::new("pdftotext");
-    cmd.arg("-layout");
-
-    if let Some(spec) = pages {
-        match parse_pages_arg(spec) {
-            Some((start, end)) => {
-                cmd.arg("-f").arg(start.to_string());
-                cmd.arg("-l").arg(end.to_string());
-            }
+    // Validate the `pages` spec once, up front, so both extractor paths
+    // surface the same error shape on bad input.
+    let page_range = match pages {
+        Some(spec) => match parse_pages_arg(spec) {
+            Some((start, end)) => Some((start, end)),
             None => {
                 return Err(ToolError::invalid_input(format!(
                     "invalid `pages` value `{spec}` (expected `N` or `N-M`, e.g. `1-5`)"
                 )));
             }
+        },
+        None => None,
+    };
+
+    // Default to the bundled pure-Rust `pdf-extract` reader: it removes
+    // the install-poppler prerequisite that bit every new user, and the
+    // crate is already a workspace dep (used by `web_run`'s URL fetch
+    // path). Users with column-heavy / complex-table PDFs (academic
+    // papers, financial filings) can opt into the historical
+    // `pdftotext -layout` route by setting
+    // `prefer_external_pdftotext = true` in `~/.config/deepseek/settings.toml`.
+    let prefer_external = crate::settings::Settings::load()
+        .map(|s| s.prefer_external_pdftotext)
+        .unwrap_or(false);
+
+    if prefer_external {
+        read_pdf_via_pdftotext(path, page_range)
+    } else {
+        read_pdf_via_pdf_extract(path, page_range)
+    }
+}
+
+fn read_pdf_via_pdf_extract(
+    path: &Path,
+    page_range: Option<(u32, u32)>,
+) -> Result<ToolResult, ToolError> {
+    let text = if let Some((start, end)) = page_range {
+        // Page-by-page extraction so we can slice the requested window
+        // without dragging every page through the caller's context.
+        // pdf-extract returns pages in document order; `start`/`end` are
+        // 1-indexed inclusive (validated above), so we convert to a
+        // 0-indexed half-open slice with bounds clamping.
+        let pages = pdf_extract::extract_text_by_pages(path).map_err(|e| {
+            ToolError::execution_failed(format!(
+                "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
+                path.display()
+            ))
+        })?;
+        let total = pages.len();
+        if total == 0 {
+            String::new()
+        } else {
+            let start_idx = (start as usize).saturating_sub(1).min(total);
+            let end_idx = (end as usize).min(total);
+            if start_idx >= end_idx {
+                String::new()
+            } else {
+                pages[start_idx..end_idx].join("\n")
+            }
         }
+    } else {
+        pdf_extract::extract_text(path).map_err(|e| {
+            ToolError::execution_failed(format!(
+                "pdf-extract failed on {}: {e} (set `prefer_external_pdftotext = true` in settings.toml to retry via pdftotext)",
+                path.display()
+            ))
+        })?
+    };
+    Ok(ToolResult::success(text))
+}
+
+fn read_pdf_via_pdftotext(
+    path: &Path,
+    page_range: Option<(u32, u32)>,
+) -> Result<ToolResult, ToolError> {
+    let mut cmd = Command::new("pdftotext");
+    cmd.arg("-layout");
+
+    if let Some((start, end)) = page_range {
+        cmd.arg("-f").arg(start.to_string());
+        cmd.arg("-l").arg(end.to_string());
     }
 
     cmd.arg(path).arg("-"); // output to stdout
@@ -261,13 +325,15 @@ fn read_pdf(path: &Path, pages: Option<&str>) -> Result<ToolResult, ToolError> {
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Structured "binary unavailable" — caller knows what to suggest.
+            // Structured "binary unavailable" — only reachable when the
+            // user explicitly opted into the external path. Hints back at
+            // both the install command and the in-tree default.
             return ToolResult::json(&json!({
                 "type": "binary_unavailable",
                 "path": path.display().to_string(),
                 "kind": "pdf",
-                "reason": "pdftotext not installed",
-                "hint": "install poppler (macOS: `brew install poppler`; Debian/Ubuntu: `apt install poppler-utils`)"
+                "reason": "pdftotext not installed (prefer_external_pdftotext = true in settings)",
+                "hint": "install poppler (macOS: `brew install poppler`; Debian/Ubuntu: `apt install poppler-utils`) — or unset `prefer_external_pdftotext` to use the bundled pure-Rust extractor"
             }))
             .map_err(|e| {
                 ToolError::execution_failed(format!("failed to serialize response: {e}"))
@@ -407,7 +473,7 @@ impl ToolSpec for EditFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replace text in a single file via exact search/replace. Use this instead of `sed -i` in `exec_shell` for in-place edits. For multi-hunk or cross-file changes, use `apply_patch` instead. Required: 'path', 'search' (exact text to find), 'replace' (text to substitute)."
+        "Replace text in a single file via exact search/replace. Use this instead of `sed -i` in `exec_shell` for one unambiguous in-place edit. `search` matches exactly by default, including whitespace and indentation; set `fuzz: true` to tolerate leading-indentation differences. Returns a compact unified diff, not the full file. For structural, multi-block, or cross-file changes, use `apply_patch` or `write_file` instead."
     }
 
     fn input_schema(&self) -> Value {
@@ -420,11 +486,15 @@ impl ToolSpec for EditFileTool {
                 },
                 "search": {
                     "type": "string",
-                    "description": "Text to search for"
+                    "description": "Exact text to search for, including whitespace, indentation, and newlines"
                 },
                 "replace": {
                     "type": "string",
                     "description": "Text to replace with"
+                },
+                "fuzz": {
+                    "type": "boolean",
+                    "description": "When true, tolerate leading whitespace differences on each searched line (default false)"
                 }
             },
             "required": ["path", "search", "replace"]
@@ -447,6 +517,7 @@ impl ToolSpec for EditFileTool {
         let path_str = required_str(&input, "path")?;
         let search = required_str(&input, "search")?;
         let replace = required_str(&input, "replace")?;
+        let fuzz = optional_bool(&input, "fuzz", false);
 
         if search == replace {
             return Err(ToolError::invalid_input(
@@ -461,14 +532,36 @@ impl ToolSpec for EditFileTool {
         })?;
 
         let count = contents.matches(search).count();
-        if count == 0 {
+        let (updated, count, fuzz_used) = if count == 0 && fuzz {
+            let matches = leading_whitespace_fuzzy_matches(&contents, search);
+            match matches.as_slice() {
+                [] => {
+                    return Err(ToolError::execution_failed(format!(
+                        "Search string not found in {}",
+                        file_path.display()
+                    )));
+                }
+                [(start, end)] => {
+                    let mut updated = contents.clone();
+                    updated.replace_range(*start..*end, replace);
+                    (updated, 1, true)
+                }
+                _ => {
+                    return Err(ToolError::execution_failed(format!(
+                        "Fuzzy search matched {} locations in {}; refine search text",
+                        matches.len(),
+                        file_path.display()
+                    )));
+                }
+            }
+        } else if count == 0 {
             return Err(ToolError::execution_failed(format!(
                 "Search string not found in {}",
                 file_path.display()
             )));
-        }
-
-        let updated = contents.replace(search, replace);
+        } else {
+            (contents.replace(search, replace), count, false)
+        };
 
         fs::write(&file_path, &updated).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
@@ -476,7 +569,20 @@ impl ToolSpec for EditFileTool {
 
         let display = file_path.display().to_string();
         let diff = make_unified_diff(&display, &contents, &updated);
-        let summary = format!("Replaced {count} occurrence(s) in {display}");
+        let summary = if count > 1 {
+            format!(
+                "Replaced {count} occurrence(s) in {display}\n\
+                 Warning: multiple matches were replaced with the same substitution. \
+                 Verify the result with read_file before proceeding."
+            )
+        } else {
+            let fuzz_note = if fuzz_used {
+                " (fuzzy indentation match)"
+            } else {
+                ""
+            };
+            format!("Replaced 1 occurrence in {display}{fuzz_note}")
+        };
         let body = if diff.is_empty() {
             format!("{summary}\n(no textual changes)")
         } else {
@@ -493,6 +599,52 @@ impl ToolSpec for EditFileTool {
 
         Ok(ToolResult::success(full_body))
     }
+}
+
+fn strip_line_leading_whitespace_with_map(input: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(input.len());
+    let mut byte_map = Vec::with_capacity(input.len());
+    let mut at_line_start = true;
+    for (idx, ch) in input.char_indices() {
+        if at_line_start && matches!(ch, ' ' | '\t') {
+            continue;
+        }
+        normalized.push(ch);
+        for _ in 0..ch.len_utf8() {
+            byte_map.push(idx);
+        }
+        at_line_start = ch == '\n';
+    }
+    (normalized, byte_map)
+}
+
+fn line_start_before(input: &str, idx: usize) -> usize {
+    input[..idx]
+        .rfind('\n')
+        .map_or(0, |newline| newline.saturating_add(1))
+}
+
+fn leading_whitespace_fuzzy_matches(contents: &str, search: &str) -> Vec<(usize, usize)> {
+    let (normalized_contents, byte_map) = strip_line_leading_whitespace_with_map(contents);
+    let (normalized_search, _) = strip_line_leading_whitespace_with_map(search);
+    if normalized_search.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel_idx) = normalized_contents[cursor..].find(&normalized_search) {
+        let norm_start = cursor + rel_idx;
+        let norm_end = norm_start + normalized_search.len();
+        let Some(&mapped_start) = byte_map.get(norm_start) else {
+            break;
+        };
+        let original_start = line_start_before(contents, mapped_start);
+        let original_end = byte_map.get(norm_end).copied().unwrap_or(contents.len());
+        matches.push((original_start, original_end));
+        cursor = norm_start.saturating_add(1);
+    }
+    matches
 }
 
 // === ListDirTool ===
@@ -850,32 +1002,168 @@ mod tests {
         assert_eq!(parse_pages_arg("abc"), None);
     }
 
+    /// Sample PDF shipped with the repo for parity tests against the
+    /// pure-Rust extractor. 38 pages, born-digital LaTeX (arXiv 2512.24601).
+    /// Path is workspace-root-relative because the fixture lives outside
+    /// the tui crate.
+    const SAMPLE_PDF_PATH: &str = "../../docs/2512.24601v2.pdf";
+
+    fn sample_pdf_present() -> bool {
+        std::path::Path::new(SAMPLE_PDF_PATH).exists()
+    }
+
+    #[test]
+    fn read_pdf_via_pdf_extract_finds_known_title() {
+        // Skip when the fixture isn't checked out (sparse clones, shallow
+        // worktrees). Local dev + CI both have it.
+        if !sample_pdf_present() {
+            // Fixture not present (sparse / shallow checkout). Silent
+            // skip — `cargo test` reports the same `ok` either way.
+            return;
+        }
+        let path = std::path::PathBuf::from(SAMPLE_PDF_PATH);
+        let result = read_pdf_via_pdf_extract(&path, None).expect("extract whole PDF");
+        assert!(result.success);
+        assert!(
+            result.content.contains("Recursive Language Models"),
+            "pdf-extract should recover the document title; got prefix {:?}",
+            &result.content.chars().take(200).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn read_pdf_via_pdf_extract_respects_pages_window() {
+        if !sample_pdf_present() {
+            // Fixture not present (sparse / shallow checkout). Silent
+            // skip — `cargo test` reports the same `ok` either way.
+            return;
+        }
+        let path = std::path::PathBuf::from(SAMPLE_PDF_PATH);
+        let single = read_pdf_via_pdf_extract(&path, Some((1, 1))).expect("single page");
+        let two = read_pdf_via_pdf_extract(&path, Some((1, 2))).expect("two pages");
+        assert!(single.success);
+        assert!(two.success);
+        // A two-page slice must be at least as long as the one-page slice
+        // (most documents have non-trivial body text past page 1).
+        assert!(
+            two.content.len() >= single.content.len(),
+            "expected pages 1-2 ({} bytes) >= page 1 ({} bytes)",
+            two.content.len(),
+            single.content.len()
+        );
+        // Title text lives on page 1 — must survive the window crop.
+        assert!(single.content.contains("Recursive Language Models"));
+    }
+
     #[tokio::test]
-    async fn read_file_returns_binary_unavailable_when_pdftotext_missing() {
-        // We can't reliably remove pdftotext from $PATH in a test, but if
-        // it's missing on the runner this test exercises that branch. If
-        // it's installed, the test exits early — covered by the parse_pages
-        // and is_pdf tests above.
-        if Command::new("pdftotext")
+    async fn read_file_pdf_path_uses_pdf_extract_by_default() {
+        if !sample_pdf_present() {
+            // Fixture not present (sparse / shallow checkout). Silent
+            // skip — `cargo test` reports the same `ok` either way.
+            return;
+        }
+        // The fixture lives outside the tui crate, so we point ToolContext
+        // at the workspace root and read by relative path. This exercises
+        // the full ReadFileTool::execute → is_pdf → read_pdf dispatch on
+        // the bundled extractor (no pdftotext required on the test host).
+        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../");
+        let ctx = ToolContext::new(workspace);
+        let result = ReadFileTool
+            .execute(json!({"path": "docs/2512.24601v2.pdf", "pages": "1"}), &ctx)
+            .await
+            .expect("execute");
+        assert!(result.success);
+        assert!(
+            result.content.contains("Recursive Language Models"),
+            "page-1 extraction must surface the title"
+        );
+    }
+
+    /// Serialises tests that mutate `DEEPSEEK_CONFIG_PATH` so they don't
+    /// race against each other — env vars are process-global and the
+    /// settings loader inspects this var on every call.
+    static DS_CONFIG_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ConfigPathEnvGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl ConfigPathEnvGuard {
+        fn capture() -> Self {
+            Self {
+                prior: std::env::var_os("DEEPSEEK_CONFIG_PATH"),
+            }
+        }
+    }
+    impl Drop for ConfigPathEnvGuard {
+        fn drop(&mut self) {
+            // Safety: scoped to test process; reverts to the captured value.
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("DEEPSEEK_CONFIG_PATH", v) },
+                None => unsafe { std::env::remove_var("DEEPSEEK_CONFIG_PATH") },
+            }
+        }
+    }
+
+    #[test]
+    fn read_pdf_routes_to_pdftotext_when_setting_opted_in() {
+        // Two concerns in one test: with `prefer_external_pdftotext = true`
+        // the dispatch must (a) call pdftotext when present, and (b) return
+        // the structured `binary_unavailable` response when pdftotext is
+        // missing.
+        // Sync test (calls `read_pdf` directly, not the async ReadFileTool
+        // wrapper) so the env-var lock is never held across an `.await`.
+        let _lock = DS_CONFIG_PATH_LOCK.lock().unwrap();
+        let _guard = ConfigPathEnvGuard::capture();
+
+        let tmp = tempdir().expect("tempdir");
+        let config_dir = tmp.path().join("cfg");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, "").unwrap();
+        // The sibling settings.toml is what Settings::load() reads.
+        fs::write(
+            config_dir.join("settings.toml"),
+            "prefer_external_pdftotext = true\n",
+        )
+        .unwrap();
+        // Safety: serialised by DS_CONFIG_PATH_LOCK; reverted by guard.
+        unsafe {
+            std::env::set_var("DEEPSEEK_CONFIG_PATH", &config_path);
+        }
+
+        let pdf_path = tmp.path().join("doc.pdf");
+        fs::write(&pdf_path, b"%PDF-1.7\n%%EOF").unwrap();
+        let outcome = read_pdf(&pdf_path, None);
+
+        let pdftotext_present = Command::new("pdftotext")
             .arg("-v")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok()
-        {
-            return;
+            .is_ok();
+
+        if pdftotext_present {
+            // pdftotext on a stub `%PDF-1.7\n%%EOF` cannot find a real
+            // trailer/xref table and fails with `exit 1`. That failure
+            // text mentions pdftotext explicitly — proof we routed
+            // through Poppler rather than falling back to the bundled
+            // extractor. Validate by inspecting the error message.
+            let err = outcome.expect_err("malformed PDF must surface the pdftotext error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("pdftotext"),
+                "error message must reference pdftotext; got {msg}"
+            );
+        } else {
+            let result = outcome.expect("binary_unavailable is a structured success, not an Err");
+            assert!(result.success);
+            assert!(result.content.contains("binary_unavailable"));
+            assert!(result.content.contains("pdftotext"));
+            assert!(
+                result.content.contains("prefer_external_pdftotext"),
+                "hint must reference the opt-in flag the user set"
+            );
         }
-        let tmp = tempdir().expect("tempdir");
-        let path = tmp.path().join("doc.pdf");
-        fs::write(&path, b"%PDF-1.7\n%%EOF").unwrap();
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let result = ReadFileTool
-            .execute(json!({"path": "doc.pdf"}), &ctx)
-            .await
-            .expect("structured response, not error");
-        assert!(result.success);
-        assert!(result.content.contains("binary_unavailable"));
-        assert!(result.content.contains("pdftotext"));
     }
 
     #[tokio::test]
@@ -949,6 +1237,11 @@ mod tests {
 
         assert!(result.success);
         assert!(result.content.contains("2 occurrence(s)"));
+        assert!(
+            result.content.contains("multiple matches were replaced"),
+            "{}",
+            result.content
+        );
         // Inline diff (#505) — the unified diff lands above the summary
         // line so the TUI's diff-aware renderer kicks in.
         assert!(result.content.contains("--- a/"), "{}", result.content);
@@ -966,6 +1259,63 @@ mod tests {
         // Verify edit was applied
         let edited = fs::read_to_string(&test_file).expect("read");
         assert_eq!(edited, "hi world hi");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_single_match_has_no_multi_match_warning() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let test_file = tmp.path().join("single.txt");
+        fs::write(&test_file, "hello world").expect("write");
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(
+                json!({"path": "single.txt", "search": "hello", "replace": "hi"}),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(result.content.contains("Replaced 1 occurrence"));
+        assert!(!result.content.contains("multiple matches were replaced"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_fuzz_tolerates_leading_whitespace() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let test_file = tmp.path().join("fuzzy.txt");
+        fs::write(
+            &test_file,
+            "fn main() {\n    if true {\n        let value = 1;\n    }\n}\n",
+        )
+        .expect("write");
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(
+                json!({
+                    "path": "fuzzy.txt",
+                    "search": "if true {\n    let value = 1;\n}",
+                    "replace": "    if true {\n        let value = 2;\n    }",
+                    "fuzz": true
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(result.content.contains("fuzzy indentation match"));
+        let edited = fs::read_to_string(&test_file).expect("read");
+        assert_eq!(
+            edited,
+            "fn main() {\n    if true {\n        let value = 2;\n    }\n}\n"
+        );
     }
 
     #[tokio::test]
@@ -1118,6 +1468,8 @@ mod tests {
         assert!(!tool.is_read_only());
         assert!(tool.is_sandboxable());
         assert_eq!(tool.approval_requirement(), ApprovalRequirement::Suggest);
+        assert!(tool.description().contains("exact search/replace"));
+        assert!(tool.description().contains("structural"));
     }
 
     #[test]
@@ -1161,6 +1513,11 @@ mod tests {
             .and_then(|value| value.as_array())
             .expect("edit schema should include required array");
         assert_eq!(required.len(), 3);
+        let search_desc = edit_schema["properties"]["search"]["description"]
+            .as_str()
+            .expect("search description");
+        assert!(search_desc.contains("Exact text"));
+        assert!(search_desc.contains("whitespace"));
 
         let list_schema = ListDirTool.input_schema();
         let required = list_schema

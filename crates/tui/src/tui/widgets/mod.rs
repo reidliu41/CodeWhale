@@ -55,6 +55,10 @@ pub struct ChatWidget {
     scrollbar: Option<TranscriptScrollbar>,
     jump_to_latest_button: Option<Rect>,
     background: Color,
+    scroll_track: Color,
+    scroll_thumb: Color,
+    jump_border: Color,
+    jump_arrow: Color,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +72,10 @@ impl ChatWidget {
     pub fn new(app: &mut App, area: Rect) -> Self {
         let content_area = area;
         let background = app.ui_theme.surface_bg;
+        let scroll_track = app.ui_theme.border;
+        let scroll_thumb = app.ui_theme.status_working;
+        let jump_border = app.ui_theme.border;
+        let jump_arrow = app.ui_theme.status_working;
         let visible_lines = content_area.height as usize;
         let render_options = app.transcript_render_options();
 
@@ -85,6 +93,10 @@ impl ChatWidget {
                 scrollbar: None,
                 jump_to_latest_button: None,
                 background,
+                scroll_track,
+                scroll_thumb,
+                jump_border,
+                jump_arrow,
             };
         }
 
@@ -294,6 +306,10 @@ impl ChatWidget {
             scrollbar,
             jump_to_latest_button,
             background,
+            scroll_track,
+            scroll_thumb,
+            jump_border,
+            jump_arrow,
         }
     }
 }
@@ -339,14 +355,20 @@ impl Renderable for ChatWidget {
                 .begin_symbol(None)
                 .end_symbol(None)
                 .track_symbol(Some("│"))
-                .track_style(Style::default().fg(palette::BORDER_COLOR))
+                .track_style(Style::default().fg(self.scroll_track))
                 .thumb_symbol("┃")
-                .thumb_style(Style::default().fg(palette::DEEPSEEK_SKY))
+                .thumb_style(Style::default().fg(self.scroll_thumb))
                 .render(area, buf, &mut state);
         }
 
         if let Some(button_area) = self.jump_to_latest_button {
-            render_jump_to_latest_button(button_area, buf, self.background);
+            render_jump_to_latest_button(
+                button_area,
+                buf,
+                self.background,
+                self.jump_border,
+                self.jump_arrow,
+            );
         }
     }
 
@@ -378,21 +400,25 @@ fn jump_to_latest_button_rect(area: Rect, has_scrollbar: bool) -> Option<Rect> {
     })
 }
 
-fn render_jump_to_latest_button(area: Rect, buf: &mut Buffer, background: Color) {
+fn render_jump_to_latest_button(
+    area: Rect,
+    buf: &mut Buffer,
+    background: Color,
+    border: Color,
+    arrow: Color,
+) {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette::BORDER_COLOR))
+        .border_style(Style::default().fg(border))
         .style(Style::default().bg(background))
         .render(area, buf);
 
     let arrow_x = area.x.saturating_add(1);
     let arrow_y = area.y.saturating_add(1);
-    buf[(arrow_x, arrow_y)].set_symbol("↓").set_style(
-        Style::default()
-            .fg(palette::DEEPSEEK_SKY)
-            .add_modifier(Modifier::BOLD),
-    );
+    buf[(arrow_x, arrow_y)]
+        .set_symbol("↓")
+        .set_style(Style::default().fg(arrow).add_modifier(Modifier::BOLD));
 }
 
 pub struct ComposerWidget<'a> {
@@ -989,6 +1015,31 @@ const APPROVAL_CARD_MAX_WIDTH: u16 = 96;
 impl Renderable for ApprovalWidget<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        // Collapsed mode: a single-line banner at the bottom of the area
+        // so the user can still see the transcript behind it.
+        if self.view.collapsed {
+            let bar_y = area.y.saturating_add(area.height.saturating_sub(1));
+            let bar_area = Rect::new(area.x, bar_y, area.width, 1);
+            Clear.render(bar_area, buf);
+
+            let risk = self.request.risk;
+            let palette_colors = approval_palette(risk);
+            let summary = format!(
+                " {} — {}  [Tab to expand] ",
+                self.request.tool_name,
+                risk_badge_text(risk, self.view.locale()),
+            );
+            let line = Line::from(Span::styled(
+                summary,
+                Style::default()
+                    .fg(palette::DEEPSEEK_INK)
+                    .bg(palette_colors.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            Paragraph::new(line).render(bar_area, buf);
             return;
         }
 
@@ -1821,24 +1872,23 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
         return Vec::new();
     }
 
-    let workspace_name = app
-        .workspace
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| app.workspace.to_string_lossy().into_owned());
+    let workspace = crate::utils::display_path(&app.workspace);
     let body_width = usize::from(area.width.saturating_sub(8).clamp(24, 72));
     let left_padding = usize::from(area.width.saturating_sub(body_width as u16) / 2);
     let inset = " ".repeat(left_padding);
 
     let body = vec![
         Line::from(Span::styled(
-            format!("{inset}DeepSeek TUI"),
+            format!("{inset}>_ DeepSeek TUI (v{})", env!("CARGO_PKG_VERSION")),
             Style::default().fg(palette::DEEPSEEK_BLUE).bold(),
         )),
+        Line::from(""),
         Line::from(Span::styled(
-            format!("{inset}{workspace_name}  ·  {}", app.model),
+            format!("{inset}model: {}  /model to switch", app.model),
+            Style::default().fg(palette::TEXT_MUTED),
+        )),
+        Line::from(Span::styled(
+            format!("{inset}directory: {workspace}"),
             Style::default().fg(palette::TEXT_MUTED),
         )),
     ];
@@ -2153,8 +2203,9 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::{
         ApprovalWidget, COMPOSER_PANEL_HEIGHT, ChatWidget, ComposerWidget, Renderable,
-        SlashMenuEntry, apply_selection_to_line, composer_height, composer_max_height,
-        composer_min_input_rows, composer_placeholder, composer_top_padding, compute_takeover_area,
+        SlashMenuEntry, apply_selection_to_line, build_empty_state_lines, composer_height,
+        composer_max_height, composer_min_input_rows, composer_placeholder, composer_top_padding,
+        compute_takeover_area,
         cursor_row_col, layout_input, pad_lines_to_bottom, placeholder_visual_lines,
         should_render_empty_state, slash_completion_hints, wrap_input_lines, wrap_text,
     };
@@ -2682,6 +2733,29 @@ mod tests {
         assert!(!should_render_empty_state(&app));
     }
 
+    #[test]
+    fn empty_state_shows_startup_context() {
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from("/tmp/deepseek-test-workspace");
+        app.model = "deepseek-v4-pro".to_string();
+
+        let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains(&format!(">_ DeepSeek TUI (v{})", env!("CARGO_PKG_VERSION"))));
+        assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
+        assert!(rendered.contains("directory: /tmp/deepseek-test-workspace"));
+    }
+
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total
     /// visual width exceeds the requested area width, even for pathological
     /// long single-line tool results.
@@ -2890,6 +2964,57 @@ mod tests {
         assert_eq!(button.width, 3);
         assert_eq!(button.height, 3);
         assert_eq!(buf[(button.x + 1, button.y + 1)].symbol(), "↓");
+    }
+
+    #[test]
+    fn chat_widget_uses_light_theme_scroll_chrome() {
+        let mut app = create_test_app();
+        app.ui_theme = palette::LIGHT_UI_THEME;
+        app.use_mouse_capture = true;
+        for i in 0..120 {
+            app.add_message(HistoryCell::User {
+                content: format!("user message {i}"),
+            });
+        }
+        app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+
+        let mut saw_track = false;
+        let mut saw_thumb = false;
+        for y in 0..area.height {
+            let cell = &buf[(area.width - 1, y)];
+            match cell.symbol() {
+                "│" => {
+                    saw_track = true;
+                    assert_eq!(cell.fg, palette::LIGHT_UI_THEME.border);
+                }
+                "┃" => {
+                    saw_thumb = true;
+                    assert_eq!(cell.fg, palette::LIGHT_UI_THEME.status_working);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_track, "scrollbar track should render");
+        assert!(saw_thumb, "scrollbar thumb should render");
+
+        let button = app
+            .viewport
+            .jump_to_latest_button_area
+            .expect("button appears when transcript is not at tail");
+        assert_eq!(
+            buf[(button.x + 1, button.y + 1)].fg,
+            palette::LIGHT_UI_THEME.status_working
+        );
     }
 
     #[test]
