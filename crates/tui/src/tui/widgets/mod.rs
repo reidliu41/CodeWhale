@@ -2205,9 +2205,9 @@ mod tests {
         ApprovalWidget, COMPOSER_PANEL_HEIGHT, ChatWidget, ComposerWidget, Renderable,
         SlashMenuEntry, apply_selection_to_line, build_empty_state_lines, composer_height,
         composer_max_height, composer_min_input_rows, composer_placeholder, composer_top_padding,
-        compute_takeover_area,
-        cursor_row_col, layout_input, pad_lines_to_bottom, placeholder_visual_lines,
-        should_render_empty_state, slash_completion_hints, wrap_input_lines, wrap_text,
+        compute_takeover_area, cursor_row_col, layout_input, pad_lines_to_bottom,
+        placeholder_visual_lines, should_render_empty_state, slash_completion_hints,
+        wrap_input_lines, wrap_text,
     };
     use crate::config::Config;
     use crate::localization::Locale;
