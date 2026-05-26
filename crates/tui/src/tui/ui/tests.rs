@@ -10,7 +10,7 @@ use crate::tui::file_mention::{
 };
 use crate::tui::footer_ui::{
     active_tool_status_label, footer_auxiliary_spans, footer_cache_spans, footer_coherence_spans,
-    footer_state_label, footer_status_line_spans, format_context_budget,
+    footer_shell_status_spans, footer_state_label, footer_status_line_spans, format_context_budget,
     format_token_count_compact, friendly_subagent_progress, render_footer_from,
 };
 use crate::tui::history::{
@@ -1621,6 +1621,94 @@ fn active_tool_status_label_counts_foreground_rlm_work() {
 
     assert!(label.contains("tool rlm"), "label: {label}");
     assert!(label.contains("1 active"), "label: {label}");
+}
+
+#[test]
+fn footer_shell_status_spans_show_running_shell_command() {
+    let mut app = create_test_app();
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        id: "shell_abcd".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo test --workspace --all-features".to_string(),
+        duration_ms: Some(12_345),
+    });
+
+    let label = spans_text(&footer_shell_status_spans(&app));
+
+    assert!(label.contains("shell: cargo test"), "label: {label}");
+    assert!(label.contains("12s"), "label: {label}");
+}
+
+#[test]
+fn footer_shell_status_spans_count_multiple_running_shells() {
+    let mut app = create_test_app();
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        id: "shell_one".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo test".to_string(),
+        duration_ms: Some(5_000),
+    });
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        id: "shell_two".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: npm run build".to_string(),
+        duration_ms: Some(65_000),
+    });
+
+    let label = spans_text(&footer_shell_status_spans(&app));
+
+    assert!(label.contains("2 shells running"), "label: {label}");
+    assert!(label.contains("1m 5s"), "label: {label}");
+}
+
+#[test]
+fn render_footer_from_includes_shell_jobs_when_enabled() {
+    let mut app = create_test_app();
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        id: "shell_abcd".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo build".to_string(),
+        duration_ms: Some(1_500),
+    });
+
+    let props = render_footer_from(&app, &crate::config::StatusItem::default_footer(), None);
+
+    assert!(spans_text(&props.agents).contains("shell: cargo build"));
+}
+
+#[test]
+fn app_new_adds_shell_jobs_to_saved_legacy_status_items() {
+    let config = Config {
+        tui: Some(crate::config::TuiConfig {
+            alternate_screen: None,
+            mouse_capture: None,
+            terminal_probe_timeout_ms: None,
+            status_items: Some(vec![
+                crate::config::StatusItem::Mode,
+                crate::config::StatusItem::Model,
+                crate::config::StatusItem::Cost,
+                crate::config::StatusItem::Status,
+                crate::config::StatusItem::Coherence,
+                crate::config::StatusItem::Agents,
+                crate::config::StatusItem::ReasoningReplay,
+                crate::config::StatusItem::Cache,
+                crate::config::StatusItem::ContextPercent,
+                crate::config::StatusItem::GitBranch,
+            ]),
+            osc8_links: None,
+            notification_condition: None,
+            composer_arrows_scroll: None,
+        }),
+        ..Config::default()
+    };
+
+    let app = App::new(create_test_options(), &config);
+
+    assert!(
+        app.status_items
+            .contains(&crate::config::StatusItem::ShellJobs),
+        "saved pre-shell footer config should still show the new background shell chip"
+    );
 }
 
 #[test]

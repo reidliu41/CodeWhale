@@ -1891,6 +1891,7 @@ impl App {
                 .tui
                 .as_ref()
                 .and_then(|tui| tui.status_items.clone())
+                .map(crate::config::StatusItem::with_current_defaults)
                 .unwrap_or_else(crate::config::StatusItem::default_footer),
             project_doc: None,
             plan_state,

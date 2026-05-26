@@ -656,7 +656,7 @@ pub struct SearchConfig {
 ///
 /// Order in the user's `Vec<StatusItem>` is preserved: items in the left
 /// cluster (`Mode`, `Model`, `Cost`, `Status`) render in the order given;
-/// right-cluster chips (`Coherence`, `Agents`, `ReasoningReplay`,
+/// right-cluster chips (`Coherence`, `Agents`, `ShellJobs`, `ReasoningReplay`,
 /// `PrefixStability`, `Cache`, `ContextPercent`, `GitBranch`,
 /// `LastToolElapsed`, `RateLimit`) likewise honour ordering inside their
 /// cluster. The split between left and right is deliberate — left holds steady
@@ -683,6 +683,8 @@ pub enum StatusItem {
     Coherence,
     /// Sub-agent count chip ("3 agents").
     Agents,
+    /// Running background shell command chip.
+    ShellJobs,
     /// Reasoning-replay token count ("rsn 12.3k").
     ReasoningReplay,
     /// Prefix stability ("cache prefix 100%").
@@ -713,9 +715,28 @@ impl StatusItem {
             StatusItem::Status,
             StatusItem::Coherence,
             StatusItem::Agents,
+            StatusItem::ShellJobs,
             StatusItem::ReasoningReplay,
             StatusItem::Cache,
         ]
+    }
+
+    /// Ensure older saved footer layouts pick up newly added default chips.
+    ///
+    /// `status_items` is an inclusion-ordered list, so a user who saved the
+    /// footer before a new default chip existed would otherwise never see it
+    /// after upgrading. Keep the existing order and append the new chip beside
+    /// other transient work indicators.
+    #[must_use]
+    pub fn with_current_defaults(mut items: Vec<StatusItem>) -> Vec<StatusItem> {
+        if !items.contains(&StatusItem::ShellJobs) {
+            if let Some(pos) = items.iter().position(|item| *item == StatusItem::Agents) {
+                items.insert(pos + 1, StatusItem::ShellJobs);
+            } else {
+                items.push(StatusItem::ShellJobs);
+            }
+        }
+        items
     }
 
     /// Stable canonical name used in TOML and the picker label.
@@ -728,6 +749,7 @@ impl StatusItem {
             StatusItem::Status => "status",
             StatusItem::Coherence => "coherence",
             StatusItem::Agents => "agents",
+            StatusItem::ShellJobs => "shell_jobs",
             StatusItem::ReasoningReplay => "reasoning_replay",
             StatusItem::PrefixStability => "prefix_stability",
             StatusItem::Cache => "cache",
@@ -748,6 +770,7 @@ impl StatusItem {
             StatusItem::Status => "Activity (ready/draft/working)",
             StatusItem::Coherence => "Coherence interventions",
             StatusItem::Agents => "Sub-agents in flight",
+            StatusItem::ShellJobs => "Shell jobs",
             StatusItem::ReasoningReplay => "Reasoning replay tokens",
             StatusItem::PrefixStability => "Prefix stability",
             StatusItem::Cache => "Prompt cache hit rate",
@@ -769,6 +792,7 @@ impl StatusItem {
             StatusItem::Status => "what the agent is doing right now",
             StatusItem::Coherence => "shown only when the engine intervenes",
             StatusItem::Agents => "agents or RLM work in progress",
+            StatusItem::ShellJobs => "running background shell commands",
             StatusItem::ReasoningReplay => "thinking tokens replayed each turn",
             StatusItem::PrefixStability => "whether system/tools stayed cacheable",
             StatusItem::Cache => "% of prompt served from cache",
@@ -789,6 +813,7 @@ impl StatusItem {
             StatusItem::Status,
             StatusItem::Coherence,
             StatusItem::Agents,
+            StatusItem::ShellJobs,
             StatusItem::ReasoningReplay,
             StatusItem::PrefixStability,
             StatusItem::Cache,
@@ -4085,6 +4110,37 @@ mod tests {
         assert_eq!(
             config.search.and_then(|search| search.provider),
             Some(SearchProvider::DuckDuckGo)
+        );
+    }
+
+    #[test]
+    fn status_items_with_current_defaults_adds_shell_jobs_after_agents() {
+        let upgraded = StatusItem::with_current_defaults(vec![
+            StatusItem::Mode,
+            StatusItem::Model,
+            StatusItem::Agents,
+            StatusItem::ReasoningReplay,
+        ]);
+
+        assert_eq!(
+            upgraded,
+            vec![
+                StatusItem::Mode,
+                StatusItem::Model,
+                StatusItem::Agents,
+                StatusItem::ShellJobs,
+                StatusItem::ReasoningReplay,
+            ]
+        );
+    }
+
+    #[test]
+    fn status_items_with_current_defaults_keeps_existing_shell_jobs_position() {
+        let configured = vec![StatusItem::Mode, StatusItem::ShellJobs, StatusItem::Agents];
+
+        assert_eq!(
+            StatusItem::with_current_defaults(configured.clone()),
+            configured
         );
     }
 

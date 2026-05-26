@@ -43,19 +43,21 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         None
     };
-    let toast = quit_prompt.or_else(|| {
-        // Version-update hint takes precedence over ephemeral status toasts
-        // so the user sees it even when status traffic would hide it.
-        app.version_hint.as_ref().map(|hint| FooterToast {
-            text: hint.clone(),
-            color: palette::STATUS_INFO,
+    let toast = quit_prompt
+        .or_else(|| {
+            // Version-update hint takes precedence over ephemeral status toasts
+            // so the user sees it even when status traffic would hide it.
+            app.version_hint.as_ref().map(|hint| FooterToast {
+                text: hint.clone(),
+                color: palette::STATUS_INFO,
+            })
         })
-    }).or_else(|| {
-        app.active_status_toast().map(|toast| FooterToast {
-            text: toast.text,
-            color: status_color(toast.level),
-        })
-    });
+        .or_else(|| {
+            app.active_status_toast().map(|toast| FooterToast {
+                text: toast.text,
+                color: status_color(toast.level),
+            })
+        });
 
     // Drive every cluster from the user's configured `status_items`. Mode
     // and Model are always rendered by `FooterProps` itself (their position
@@ -327,6 +329,64 @@ pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
     Some(parts.join(" \u{00B7} "))
 }
 
+fn append_footer_chip(target: &mut Vec<Span<'static>>, chip: Vec<Span<'static>>) {
+    if chip.is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push(Span::raw("  "));
+    }
+    target.extend(chip);
+}
+
+pub(crate) fn footer_shell_status_spans(app: &App) -> Vec<Span<'static>> {
+    let running_shells = app
+        .task_panel
+        .iter()
+        .filter_map(|task| {
+            if task.status != "running" {
+                return None;
+            }
+            let command = task.prompt_summary.strip_prefix("shell: ")?.trim();
+            Some((command, task.duration_ms))
+        })
+        .collect::<Vec<_>>();
+
+    if running_shells.is_empty() {
+        return Vec::new();
+    }
+
+    let longest = running_shells
+        .iter()
+        .filter_map(|(_, duration)| *duration)
+        .max()
+        .map(|ms| {
+            crate::tui::notifications::humanize_duration(std::time::Duration::from_millis(ms))
+        });
+    let label = if running_shells.len() == 1 {
+        let command = running_shells[0].0;
+        let command = if command.is_empty() {
+            "command".to_string()
+        } else {
+            truncate_line_to_width(command, 28)
+        };
+        match longest {
+            Some(elapsed) => format!("shell: {command} \u{00B7} {elapsed}"),
+            None => format!("shell: {command}"),
+        }
+    } else {
+        match longest {
+            Some(elapsed) => format!("{} shells running \u{00B7} {elapsed}", running_shells.len()),
+            None => format!("{} shells running", running_shells.len()),
+        }
+    };
+
+    vec![Span::styled(
+        label,
+        Style::default().fg(app.ui_theme.status_working),
+    )]
+}
+
 fn collect_active_tool_status(cell: &HistoryCell, snapshot: &mut ActiveToolStatusSnapshot) {
     let HistoryCell::Tool(tool) = cell else {
         return;
@@ -426,11 +486,16 @@ pub(crate) fn render_footer_from(
     } else {
         Vec::new()
     };
-    let agents = if has(S::Agents) {
-        crate::tui::widgets::footer_agents_chip(running_agent_count(app), app.ui_locale)
-    } else {
-        Vec::new()
-    };
+    let mut agents = Vec::new();
+    if has(S::Agents) {
+        append_footer_chip(
+            &mut agents,
+            crate::tui::widgets::footer_agents_chip(running_agent_count(app), app.ui_locale),
+        );
+    }
+    if has(S::ShellJobs) {
+        append_footer_chip(&mut agents, footer_shell_status_spans(app));
+    }
     let reasoning_replay = if has(S::ReasoningReplay) {
         footer_reasoning_replay_spans(app)
     } else {
@@ -583,6 +648,7 @@ pub(crate) fn footer_auxiliary_spans(app: &App, max_width: usize) -> Vec<Span<'s
     let coherence_spans = footer_coherence_spans(app);
     let agents_spans =
         crate::tui::widgets::footer_agents_chip(running_agent_count(app), app.ui_locale);
+    let shell_spans = footer_shell_status_spans(app);
     let replay_spans = footer_reasoning_replay_spans(app);
     let cache_spans = footer_cache_spans(app);
     let cost_spans = footer_cost_spans(app);
@@ -600,6 +666,7 @@ pub(crate) fn footer_auxiliary_spans(app: &App, max_width: usize) -> Vec<Span<'s
     let parts: Vec<&Vec<Span<'static>>> = [
         &coherence_spans,
         &agents_spans,
+        &shell_spans,
         &replay_spans,
         &prefix_spans,
         &cache_spans,
